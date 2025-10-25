@@ -1,41 +1,41 @@
 version: "3"
 
 services:
-  backend:
-    image: frappe/erpnext:v15.84.0
+  # 1. NEW SERVICE: Ensures 'sites' volume has correct ownership (UID 1000)
+  init-sites:
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: root
     networks:
       - frappe_network
+    # Run chown to ensure UID 1000 (frappe) owns the sites directory
+    command: "chown -R 1000:1000 /home/frappe/frappe-bench/sites"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
     deploy:
       restart_policy:
         condition: on-failure
-    volumes:
-      - sites:/home/frappe/frappe-bench/sites
-      - logs:/home/frappe/frappe-bench/logs
-    environment:
-      DB_HOST: db
-      DB_PORT: "3306"
-      MYSQL_ROOT_PASSWORD: admin
-      MARIADB_ROOT_PASSWORD: admin
 
+  # 2. CONFIGURATOR: Runs AFTER init-sites fixes permissions
   configurator:
-    image: frappe/erpnext:v15.84.0
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: frappe
     networks:
       - frappe_network
     deploy:
       restart_policy:
         condition: none
     entrypoint:
-      - bash
+      - /bin/bash
       - -c
     command:
-      - >
-        ls -1 apps > sites/apps.txt;
-        bench set-config -g db_host $$DB_HOST;
-        bench set-config -gp db_port $$DB_PORT;
-        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
-        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
-        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
-        bench set-config -gp socketio_port $$SOCKETIO_PORT;
+    - >
+      ls -1 apps > sites/apps.txt;
+      /home/frappe/.local/bin/bench set-config -g db_host $$DB_HOST;
+      /home/frappe/.local/bin/bench set-config -gp db_port $$DB_PORT;
+      /home/frappe/.local/bin/bench set-config -g redis_cache "redis://$$REDIS_CACHE";
+      /home/frappe/.local/bin/bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
+      /home/frappe/.local/bin/bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
+      /home/frappe/.local/bin/bench set-config -gp socketio_port $$SOCKETIO_PORT;
     environment:
       DB_HOST: db
       DB_PORT: "3306"
@@ -45,9 +45,14 @@ services:
     volumes:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      init-sites:
+        condition: service_completed_successfully
 
+  # 3. CREATE-SITE: Runs AFTER configurator is complete
   create-site:
-    image: frappe/erpnext:v15.84.0
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: frappe
     networks:
       - frappe_network
     deploy:
@@ -77,7 +82,31 @@ services:
           fi
         done;
         echo "sites/common_site_config.json found";
-        bench new-site --mariadb-user-host-login-scope='%' --admin-password=admin --db-root-username=root --db-root-password=admin --install-app erpnext --set-default frontend;
+        /home/frappe/.local/bin/bench new-site --mariadb-user-host-login-scope='%' --admin-password=admin --db-root-username=root --db-root-password=admin --install-app one_fm_google_integration --set-default frontend;
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  # 4. BACKEND/DB/REDIS (No changes needed, they seem to work)
+  backend:
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: frappe
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      MYSQL_ROOT_PASSWORD: admin
+      MARIADB_ROOT_PASSWORD: admin
+    depends_on:
+      create-site:
+        condition: service_completed_successfully
 
   db:
     image: mariadb:10.6
@@ -101,70 +130,6 @@ services:
     volumes:
       - db-data:/var/lib/mysql
 
-  frontend:
-    image: frappe/erpnext:v15.84.0
-    networks:
-      - frappe_network
-    depends_on:
-      - websocket
-    deploy:
-      restart_policy:
-        condition: on-failure
-    command:
-      - nginx-entrypoint.sh
-    environment:
-      BACKEND: backend:8000
-      FRAPPE_SITE_NAME_HEADER: frontend
-      SOCKETIO: websocket:9000
-      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
-      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
-      UPSTREAM_REAL_IP_RECURSIVE: "off"
-      PROXY_READ_TIMEOUT: 120
-      CLIENT_MAX_BODY_SIZE: 50m
-    volumes:
-      - sites:/home/frappe/frappe-bench/sites
-      - logs:/home/frappe/frappe-bench/logs
-    ports:
-      - "8080:8080"
-
-  queue-long:
-    image: frappe/erpnext:v15.84.0
-    networks:
-      - frappe_network
-    deploy:
-      restart_policy:
-        condition: on-failure
-    command:
-      - bench
-      - worker
-      - --queue
-      - long,default,short
-    volumes:
-      - sites:/home/frappe/frappe-bench/sites
-      - logs:/home/frappe/frappe-bench/logs
-    environment:
-      FRAPPE_REDIS_CACHE: redis://redis-cache:6379
-      FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
-
-  queue-short:
-    image: frappe/erpnext:v15.84.0
-    networks:
-      - frappe_network
-    deploy:
-      restart_policy:
-        condition: on-failure
-    command:
-      - bench
-      - worker
-      - --queue
-      - short,default
-    volumes:
-      - sites:/home/frappe/frappe-bench/sites
-      - logs:/home/frappe/frappe-bench/logs
-    environment:
-      FRAPPE_REDIS_CACHE: redis://redis-cache:6379
-      FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
-
   redis-queue:
     image: redis:6.2-alpine
     networks:
@@ -183,22 +148,82 @@ services:
       restart_policy:
         condition: on-failure
 
-  scheduler:
-    image: frappe/erpnext:v15.84.0
+  # 5. FRONTEND (The permission issue fix is in the image, but we add the user)
+  frontend:
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: frappe
+    networks:
+      - frappe_network
+    depends_on:
+      - websocket
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command: "/usr/local/bin/nginx-entrypoint.sh"
+    environment:
+      BACKEND: backend:8000
+      FRAPPE_SITE_NAME_HEADER: frontend
+      SOCKETIO: websocket:9000
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: 120
+      CLIENT_MAX_BODY_SIZE: 50m
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    ports:
+      - "8080:8080"
+
+  # 6. WORKERS (Adding 'user: frappe' to prevent permission errors when writing logs/pid files)
+  queue-long:
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: frappe
     networks:
       - frappe_network
     deploy:
       restart_policy:
         condition: on-failure
-    command:
-      - bench
-      - schedule
+    command: "/home/frappe/.local/bin/bench worker --queue long,default,short"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    environment:
+      FRAPPE_REDIS_CACHE: redis://redis-cache:6379
+      FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
+
+  queue-short:
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: frappe
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command: "/home/frappe/.local/bin/bench worker --queue short,default"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    environment:
+      FRAPPE_REDIS_CACHE: redis://redis-cache:6379
+      FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
+
+  scheduler:
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: frappe
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command: "/home/frappe/.local/bin/bench schedule"
     volumes:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
 
   websocket:
-    image: frappe/erpnext:v15.84.0
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: frappe
     networks:
       - frappe_network
     deploy:
