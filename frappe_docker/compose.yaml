@@ -1,95 +1,322 @@
-x-customizable-image: &customizable_image
-  # By default the image used only contains the `frappe` and `erpnext` apps.
-  # See https://github.com/frappe/frappe_docker/blob/main/docs/custom-apps.md
-  # about using custom images.
-  image: ${CUSTOM_IMAGE:-frappe/erpnext}:${CUSTOM_TAG:-$ERPNEXT_VERSION}
-  pull_policy: ${PULL_POLICY:-always}
-  restart: ${RESTART_POLICY:-unless-stopped}
+# ------------------------------------------- Modified by SK Rohit ----------------------------------------------------------#
 
-x-depends-on-configurator: &depends_on_configurator
-  depends_on:
-    configurator:
-      condition: service_completed_successfully
+#   This is the Customized Docker Composefile for ONE-FM Frappe Application it uses the ".env" file to get the Docker Image.
 
-x-backend-defaults: &backend_defaults
-  <<: [*depends_on_configurator, *customizable_image]
-  volumes:
-    - sites:/home/frappe/frappe-bench/sites
+# ---------------------------------------------------------------------------------------------------------------------------#
 
 services:
+  # 1. NEW SERVICE ADDED BY SKR: Ensures 'sites' volume has correct ownership (UID 1000)
+  init-sites:
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: root
+    networks:
+      - frappe_network
+    command: "chown -R 1000:1000 /home/frappe/frappe-bench/sites"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  # 2. CONFIGURATOR: Runs AFTER init-sites fixes permissions
   configurator:
-    <<: *backend_defaults
-    platform: linux/amd64
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: frappe
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: none
+    entrypoint:
+      - /bin/bash
+      - -c
+    command:
+    - >
+      ls -1 apps > sites/apps.txt;
+      /home/frappe/.local/bin/bench set-config -g db_host $$DB_HOST;
+      /home/frappe/.local/bin/bench set-config -gp db_port $$DB_PORT;
+      /home/frappe/.local/bin/bench set-config -g redis_cache "redis://$$REDIS_CACHE";
+      /home/frappe/.local/bin/bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
+      /home/frappe/.local/bin/bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
+      /home/frappe/.local/bin/bench set-config -gp socketio_port $$SOCKETIO_PORT;
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      REDIS_CACHE: redis-cache:6379
+      REDIS_QUEUE: redis-queue:6379
+      SOCKETIO_PORT: "9000"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      init-sites:
+        condition: service_completed_successfully # Waits for Init service
+
+  # 3. CREATE-SITE: Runs AFTER configurator is complete
+  create-site:
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: frappe
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: none
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
     entrypoint:
       - bash
       - -c
-    # add redis_socketio for backward compatibility
     command:
       - >
-        ls -1 apps > sites/apps.txt;
-        bench set-config -g db_host $$DB_HOST;
-        bench set-config -gp db_port $$DB_PORT;
-        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
-        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
-        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
-        bench set-config -gp socketio_port $$SOCKETIO_PORT;
-    environment:
-      DB_HOST: ${DB_HOST:-}
-      DB_PORT: ${DB_PORT:-}
-      REDIS_CACHE: ${REDIS_CACHE:-}
-      REDIS_QUEUE: ${REDIS_QUEUE:-}
-      SOCKETIO_PORT: 9000
-    depends_on: {}
-    restart: on-failure
+        wait-for-it -t 120 db:3306;
+        wait-for-it -t 120 redis-cache:6379;
+        wait-for-it -t 120 redis-queue:6379;
+        export start=`date +%s`;
+        until [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".db_host // empty"` ]] && \
+          [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_cache // empty"` ]] && \
+          [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_queue // empty"` ]];
+        do
+          echo "Waiting for sites/common_site_config.json to be created";
+          sleep 5;
+          if (( `date +%s`-start > 120 )); then
+            echo "could not find sites/common_site_config.json with required keys";
+            exit 1
+          fi
+        done;
+        echo "sites/common_site_config.json found";
+        /home/frappe/.local/bin/bench new-site --mariadb-user-host-login-scope='%' --admin-password=admin --db-root-username=root --db-root-password=admin --install-app one_fm_google_integration --set-default frontend;
+    depends_on:
+      configurator:
+        condition: service_completed_successfully #Waits for configurator service
 
+  # 4. BACKEND/DB/REDIS
   backend:
-    <<: *backend_defaults
-    platform: linux/amd64
-
-  frontend:
-    <<: *customizable_image
-    platform: linux/amd64
-    command:
-      - nginx-entrypoint.sh
-    environment:
-      BACKEND: backend:8000
-      SOCKETIO: websocket:9000
-      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER:-$$host}
-      UPSTREAM_REAL_IP_ADDRESS: ${UPSTREAM_REAL_IP_ADDRESS:-127.0.0.1}
-      UPSTREAM_REAL_IP_HEADER: ${UPSTREAM_REAL_IP_HEADER:-X-Forwarded-For}
-      UPSTREAM_REAL_IP_RECURSIVE: ${UPSTREAM_REAL_IP_RECURSIVE:-off}
-      PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
-      CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: frappe
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
     volumes:
       - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      MYSQL_ROOT_PASSWORD: admin
+      MARIADB_ROOT_PASSWORD: admin
     depends_on:
-      - backend
+      create-site:
+        condition: service_completed_successfully
+
+  db:
+    image: mariadb:10.6
+    networks:
+      - frappe_network
+    healthcheck:
+      test: mysqladmin ping -h localhost --password=admin
+      interval: 1s
+      retries: 20
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed # Temporary fix for MariaDB 10.6
+    environment:
+      MYSQL_ROOT_PASSWORD: admin
+      MARIADB_ROOT_PASSWORD: admin
+    volumes:
+      - db-data:/var/lib/mysql
+
+  redis-queue:
+    image: redis:6.2-alpine
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+    volumes:
+      - redis-queue-data:/data
+
+  redis-cache:
+    image: redis:6.2-alpine
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  # 5. FRONTEND
+  frontend:
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: frappe
+    networks:
+      - frappe_network
+    depends_on:
       - websocket
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command: "/usr/local/bin/nginx-entrypoint.sh"
+    environment:
+      BACKEND: backend:8000
+      FRAPPE_SITE_NAME_HEADER: frontend
+      SOCKETIO: websocket:9000
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: 120
+      CLIENT_MAX_BODY_SIZE: 50m
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    ports:
+      - "8080:8080"
+
+  # 6. WORKERS
+  queue-long:
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: frappe
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command: "/home/frappe/.local/bin/bench worker --queue long,default,short"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    environment:
+      FRAPPE_REDIS_CACHE: redis://redis-cache:6379
+      FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
+
+  queue-short:
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: frappe
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command: "/home/frappe/.local/bin/bench worker --queue short,default"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    environment:
+      FRAPPE_REDIS_CACHE: redis://redis-cache:6379
+      FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
+
+  scheduler:
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: frappe
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command: "/home/frappe/.local/bin/bench schedule"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
 
   websocket:
-    <<: [*depends_on_configurator, *customizable_image]
-    platform: linux/amd64
+    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
+    user: frappe
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
     command:
       - node
       - /home/frappe/frappe-bench/apps/frappe/socketio.js
+    environment:
+      FRAPPE_REDIS_CACHE: redis://redis-cache:6379
+      FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
     volumes:
       - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+      
+  # --- MONITORING STACK ---
+  prometheus:
+    image: prom/prometheus:v2.45.0 # Use a specific version
+    container_name: prometheus
+    volumes:
+      - ./monitoring_configs/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus # Persistent data for Prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090" # Access Prometheus UI on port 9090
+    networks:
+      - frappe_network
+    restart: unless-stopped
 
-  queue-short:
-    <<: *backend_defaults
-    platform: linux/amd64
-    command: bench worker --queue short,default
+  node-exporter:
+    image: prom/node-exporter:v1.5.0 # Use a specific version
+    container_name: node-exporter
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc|rootfs/var/lib/docker/containers|rootfs/var/lib/docker/overlay2|rootfs/run/docker/netns|rootfs/var/lib/docker/aufs)($$|/)'
+    ports:
+      - "9100:9100" # Exposes node metrics
+    networks:
+      - frappe_network
+    pid: host # Needed to access host metrics correctly
+    restart: unless-stopped
 
-  queue-long:
-    <<: *backend_defaults
-    platform: linux/amd64
-    command: bench worker --queue long,default,short
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.47.1 # Use a specific version
+    container_name: cadvisor
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    ports:
+      - "8081:8080" # Access cAdvisor UI on port 8081 (to avoid conflict)
+    networks:
+      - frappe_network
+    privileged: true # Required for cAdvisor to get container stats
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    restart: unless-stopped
 
-  scheduler:
-    <<: *backend_defaults
-    platform: linux/amd64
-    command: bench schedule
+  grafana:
+    image: grafana/grafana:9.5.1 # Use a specific version
+    container_name: grafana
+    volumes:
+      - grafana_data:/var/lib/grafana # Persistent data for Grafana
+    ports:
+      - "3000:3000" # Access Grafana UI on port 3000
+    networks:
+      - frappe_network
+    restart: unless-stopped
+    depends_on:
+      - prometheus
 
-# ERPNext requires local assets access (Frappe does not)
 volumes:
+  db-data:
+  redis-queue-data:
   sites:
+  logs:
+  prometheus_data: # New volume for Prometheus
+  grafana_data:    # New volume for Grafana
+
+networks:
+  frappe_network:
+    driver: bridge

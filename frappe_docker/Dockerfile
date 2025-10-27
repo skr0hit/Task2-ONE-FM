@@ -1,8 +1,13 @@
+# ------------------------------------------- Modified by SK Rohit ----------------------------------------------------------#
+
+#                         This is the Customized Dockerfile for ONE-FM Frappe Application.
+
+# ---------------------------------------------------------------------------------------------------------------------------#
 ARG PYTHON_VERSION=3.11.6
 ARG DEBIAN_BASE=bookworm
 FROM python:${PYTHON_VERSION}-slim-${DEBIAN_BASE} AS base
 
-# --- MODIFIED --- Use path relative to build context ('..')
+# --- MODIFIED --- Used complete path to avoid confusion
 COPY frappe_docker/resources/nginx-template.conf /templates/nginx/frappe.conf.template
 COPY frappe_docker/resources/nginx-entrypoint.sh /usr/local/bin/nginx-entrypoint.sh
 # --- END MODIFIED ---
@@ -127,10 +132,10 @@ RUN if [ -n "${APPS_JSON_BASE64}" ]; then \
 
 USER frappe
 
-# --- FIX: Set PATH for frappe user's local bin ---
+# --- Set PATH for frappe user's local bin ---
 ENV PATH=/home/frappe/.local/bin:${PATH}
 
-# --- FIX: Install bench *as the frappe user* ---
+# --- Install bench *as the frappe user* ---
 RUN pip3 install frappe-bench --break-system-packages
 
 ARG FRAPPE_BRANCH=version-15
